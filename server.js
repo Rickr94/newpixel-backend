@@ -18,6 +18,28 @@ const PORT = process.env.PORT || 8765;
 const MAX_MB = Number(process.env.MAX_MB || 30);
 const MAX_SEC = Number(process.env.MAX_SEC || 600);
 const MAX_BYTES = MAX_MB * 1024 * 1024;
+const FREE_PER_DAY = Number(process.env.FREE_PER_DAY || 10);
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const KEYS_FILE = path.join(__dirname, 'keys.json');
+
+let KEYS = {};
+try { KEYS = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')); } catch {}
+function saveKeys() { try { fs.writeFileSync(KEYS_FILE, JSON.stringify(KEYS, null, 1)); } catch {} }
+const freeMap = new Map();
+function clientIp(req) { return String(req.headers['x-forwarded-for']?.split(',')[0] || req.socket?.remoteAddress || 'unknown').slice(0, 64); }
+function todayStr() { return new Date().toISOString().slice(0, 10); }
+function checkAccess(key, ip) {
+  const k = String(key || '').trim().toUpperCase();
+  if (k && KEYS[k] && (KEYS[k].used || 0) < (KEYS[k].quota || 0)) return { ok: true, mode: 'key', key: k, remaining: KEYS[k].quota - KEYS[k].used - 1 };
+  const t = todayStr(), e = freeMap.get(ip);
+  const used = (e && e.date === t) ? e.count : 0;
+  if (used < FREE_PER_DAY) return { ok: true, mode: 'free', remaining: FREE_PER_DAY - used - 1 };
+  return { ok: false, freeUsed: used };
+}
+function consume(key, ip, mode) {
+  if (mode === 'key' && key && KEYS[key]) { KEYS[key].used = (KEYS[key].used || 0) + 1; saveKeys(); }
+  else if (mode === 'free') { const t = todayStr(), e = freeMap.get(ip); freeMap.set(ip, { date: t, count: ((e && e.date === t) ? e.count : 0) + 1 }); }
+}
 
 const KNOWN = /(youtube\.com|youtu\.be|youtube-nocookie\.com|soundcloud\.com|bandcamp\.com|vimeo\.com|tiktok\.com|facebook\.com|fb\.watch|instagram\.com|twitter\.com|x\.com|twitch\.tv|mixcloud\.com|audiomack\.com|audius\.co|hearthis\.at|dailymotion\.com|vk\.com|bilibili\.com|nicovideo\.jp)/i;
 const DIRECT = /\.(mp3|wav|ogg|m4a|flac|opus|webm)(\?.*)?$/i;
@@ -53,8 +75,28 @@ async function ytTitle(url, fallback) {
 
 app.get('/ping', (req, res) => res.json({ ok: true, service: 'newpixel-audio-backend' }));
 
+app.get('/key/check', (req, res) => {
+  const k = String(req.query.key || '').trim().toUpperCase();
+  if (k && KEYS[k]) return res.json({ ok: true, quota: KEYS[k].quota, used: KEYS[k].used || 0, remaining: Math.max(0, KEYS[k].quota - (KEYS[k].used || 0)) });
+  const ip = clientIp(req), t = todayStr(), e = freeMap.get(ip);
+  const used = (e && e.date === t) ? e.count : 0;
+  return res.json({ ok: false, freeUsed: used, freeQuota: FREE_PER_DAY, freeRemaining: Math.max(0, FREE_PER_DAY - used) });
+});
+app.post('/admin/key', (req, res) => {
+  if (!ADMIN_TOKEN || req.body?.adminToken !== ADMIN_TOKEN) return res.status(403).json({ error: 'forbidden' });
+  const quota = Math.min(10000, Math.max(1, Number(req.body?.quota || 100)));
+  const note = String(req.body?.note || '').slice(0, 80);
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let key = ''; for (let i = 0; i < 16; i++) { key += chars[Math.floor(Math.random() * chars.length)]; if (i % 4 === 3 && i < 15) key += '-'; }
+  KEYS[key] = { quota, used: 0, note, created: todayStr() }; saveKeys();
+  res.json({ ok: true, key, quota });
+});
+
 async function handleAudio(req, res, strictYoutube) {
   const u = String(req.body?.url || '');
+  const licRaw = String(req.body?.lic || '').trim().toUpperCase();
+  const acc = checkAccess(licRaw, clientIp(req));
+  if (!acc.ok) return res.status(402).json({ error: 'NEED_KEY', freeUsed: acc.freeUsed, freeQuota: FREE_PER_DAY });
   if (strictYoutube) {
     if (!/^https:\/\/((www\.|m\.|music\.)?youtube\.com\/(watch|shorts|embed\/|live\/)|youtu\.be\/)[a-zA-Z0-9\-_?=&%+.,;:@/#]*$/.test(u) || /["\s]/.test(u))
       return res.status(400).json({ error: 'BAD_URL' });
@@ -80,7 +122,8 @@ async function handleAudio(req, res, strictYoutube) {
         } catch {}
         const ext = (path.extname(new URL(u).pathname) || '.mp3').toLowerCase();
         const mime = ext === '.m4a' ? 'audio/mp4' : (['.webm', '.ogg', '.opus'].includes(ext) ? 'audio/ogg' : ext === '.wav' ? 'audio/wav' : ext === '.flac' ? 'audio/flac' : 'audio/mpeg');
-        return res.json({ status: 200, title, mime, size: buf.length, audioBase64: buf.toString('base64') });
+        consume(acc.mode === 'key' ? acc.key : null, clientIp(req), acc.mode);
+        return res.json({ status: 200, title, mime, size: buf.length, audioBase64: buf.toString('base64'), keyMode: acc.mode, keyRemaining: acc.remaining });
       } catch (e) {
         return res.status(500).json({ error: 'YTFAIL', detail: String(e.message || e).slice(0, 300) });
       }
@@ -151,24 +194,36 @@ async function handleAudio(req, res, strictYoutube) {
     } else title = await ytTitle(u, vid);
     const ext = path.extname(got).toLowerCase();
     const mime = ext === '.m4a' ? 'audio/mp4' : (['.webm', '.ogg', '.opus'].includes(ext) ? 'audio/ogg' : ext === '.wav' ? 'audio/wav' : ext === '.flac' ? 'audio/flac' : 'audio/mpeg');
-    return res.json({ status: 200, title, mime, size: buf.length, audioBase64: buf.toString('base64') });
+    consume(acc.mode === 'key' ? acc.key : null, clientIp(req), acc.mode);
+    return res.json({ status: 200, title, mime, size: buf.length, audioBase64: buf.toString('base64'), keyMode: acc.mode, keyRemaining: acc.remaining });
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 }
 
 app.post('/audio', (req, res) => handleAudio(req, res, false));
 app.post('/youtube', (req, res) => handleAudio(req, res, true));
+app.post('/export/use', (req, res) => {
+  const lic = String(req.body?.lic || '').trim().toUpperCase();
+  const acc = checkAccess(lic, clientIp(req));
+  if (!acc.ok) return res.status(402).json({ error: 'NEED_KEY', freeUsed: acc.freeUsed, freeQuota: FREE_PER_DAY });
+  consume(acc.mode === 'key' ? acc.key : null, clientIp(req), acc.mode);
+  res.json({ ok: true, mode: acc.mode, remaining: acc.remaining });
+});
 
 // --- Roblox forward (sama kayak proxy ps1, biar upload jalan online) ---
 app.post('/upload', async (req, res) => {
-  const { key, audioBase64, request, mime, filename } = req.body || {};
+  const { key, audioBase64, request, mime, filename, lic } = req.body || {};
   if (!key || !audioBase64 || !request) return res.status(400).json({ error: 'key/request/audioBase64 wajib' });
+  const acc = checkAccess(String(lic || '').toUpperCase(), clientIp(req));
+  if (!acc.ok) return res.status(402).json({ error: 'NEED_KEY', freeUsed: acc.freeUsed, freeQuota: FREE_PER_DAY });
   try {
     const fd = new FormData();
     fd.append('request', request);
     const blob = new Blob([Buffer.from(audioBase64, 'base64')], { type: mime || 'audio/mpeg' });
     fd.append('fileContent', blob, filename || 'audio.mp3');
     const r = await fetch('https://apis.roblox.com/assets/v1/assets', { method: 'POST', headers: { 'x-api-key': key }, body: fd });
-    res.status(r.status).json({ status: r.status, body: await r.text() });
+    const body = await r.text();
+    if (r.status >= 200 && r.status < 300) consume(acc.mode === 'key' ? acc.key : null, clientIp(req), acc.mode);
+    res.status(r.status).json({ status: r.status, body, keyMode: acc.mode, keyRemaining: acc.remaining });
   } catch (e) { res.status(500).json({ error: String(e.message || e).slice(0, 300) }); }
 });
 app.post('/status', async (req, res) => {
