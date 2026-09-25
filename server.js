@@ -75,8 +75,7 @@ async function ytTitle(url, fallback) {
 
 app.get('/ping', (req, res) => res.json({ ok: true, service: 'newpixel-audio-backend' }));
 
-app.get('/key/check', (req, res) => {
-  const k = String(req.query.key || '').trim().toUpperCase();
+app.get('/key/check', (req, res) => {  const k = String(req.query.key || '').trim().toUpperCase();
   if (k && KEYS[k]) return res.json({ ok: true, quota: KEYS[k].quota, used: KEYS[k].used || 0, remaining: Math.max(0, KEYS[k].quota - (KEYS[k].used || 0)) });
   const ip = clientIp(req), t = todayStr(), e = freeMap.get(ip);
   const used = (e && e.date === t) ? e.count : 0;
@@ -90,6 +89,11 @@ app.post('/admin/key', (req, res) => {
   let key = ''; for (let i = 0; i < 16; i++) { key += chars[Math.floor(Math.random() * chars.length)]; if (i % 4 === 3 && i < 15) key += '-'; }
   KEYS[key] = { quota, used: 0, note, created: todayStr() }; saveKeys();
   res.json({ ok: true, key, quota });
+});
+app.get('/admin/keys', (req, res) => {
+  if (!ADMIN_TOKEN || req.query.adminToken !== ADMIN_TOKEN) return res.status(403).json({ error: 'forbidden' });
+  const list = Object.entries(KEYS).map(([key, v]) => ({ key, quota: v.quota, used: v.used || 0, remaining: Math.max(0, (v.quota || 0) - (v.used || 0)), note: v.note || '' }));
+  res.json({ ok: true, count: list.length, keys: list });
 });
 
 async function handleAudio(req, res, strictYoutube) {
