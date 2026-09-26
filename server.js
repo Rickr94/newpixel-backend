@@ -21,6 +21,8 @@ const MAX_BYTES = MAX_MB * 1024 * 1024;
 const FREE_PER_DAY = Number(process.env.FREE_PER_DAY || 10);
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const KEYS_FILE = path.join(__dirname, 'keys.json');
+const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 2);
+let activeAudio = 0;
 
 let KEYS = {};
 try { KEYS = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')); } catch {}
@@ -101,6 +103,9 @@ async function handleAudio(req, res, strictYoutube) {
   const licRaw = String(req.body?.lic || '').trim().toUpperCase();
   const acc = checkAccess(licRaw, clientIp(req));
   if (!acc.ok) return res.status(402).json({ error: 'NEED_KEY', freeUsed: acc.freeUsed, freeQuota: FREE_PER_DAY });
+  if (activeAudio >= MAX_CONCURRENT) return res.status(503).json({ error: 'BUSY' });
+  activeAudio++;
+  try {
   if (strictYoutube) {
     if (!/^https:\/\/((www\.|m\.|music\.)?youtube\.com\/(watch|shorts|embed\/|live\/)|youtu\.be\/)[a-zA-Z0-9\-_?=&%+.,;:@/#]*$/.test(u) || /["\s]/.test(u))
       return res.status(400).json({ error: 'BAD_URL' });
@@ -201,6 +206,7 @@ async function handleAudio(req, res, strictYoutube) {
     consume(acc.mode === 'key' ? acc.key : null, clientIp(req), acc.mode);
     return res.json({ status: 200, title, mime, size: buf.length, audioBase64: buf.toString('base64'), keyMode: acc.mode, keyRemaining: acc.remaining });
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  } finally { activeAudio--; }
 }
 
 app.post('/audio', (req, res) => handleAudio(req, res, false));
