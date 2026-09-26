@@ -12,7 +12,7 @@ const path = require('path');
 const execFileAsync = promisify(execFile);
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '40mb' }));
 
 const PORT = process.env.PORT || 8765;
 const MAX_MB = Number(process.env.MAX_MB || 30);
